@@ -197,8 +197,13 @@ def validate_settings() -> None | ValueError | TypeError:
 
     check_boolean(close_tabs, "close_tabs")
     check_boolean(follow_companies, "follow_companies")
-    # check_boolean(connect_hr, "connect_hr")
-    # check_string(connect_request_message, "connect_request_message", min_length=10)
+    check_boolean(connect_hr, "connect_hr")
+    check_string(connect_request_message, "connect_request_message")
+    check_boolean(follow_hr, "follow_hr")
+    check_int(max_hr_connect_attempts_per_run, "max_hr_connect_attempts_per_run", 1)
+    check_int(retry_hr_connect_passes, "retry_hr_connect_passes", 1)
+    if retry_hr_connect_passes > 3:
+        raise ValueError('Invalid input for retry_hr_connect_passes. Expecting Integer in range [1, 3].')
 
     check_boolean(run_non_stop, "run_non_stop")
     check_boolean(alternate_sortby, "alternate_sortby")

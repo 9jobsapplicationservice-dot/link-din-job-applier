@@ -16,6 +16,7 @@ version:    26.01.20.5.08
 
 import os
 import re
+import shutil
 import pathlib
 import subprocess
 from datetime import datetime
@@ -112,6 +113,7 @@ def create_unique_temp_profile_path() -> str:
     Create a unique temp profile path per run to avoid DevTools/Singleton lock collisions.
     '''
     base_path = pathlib.Path(get_default_temp_profile())
+    prune_old_temp_profiles(base_path, keep_latest=5)
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{randint(1000, 9999)}"
     return str(base_path / f"run-{run_id}")
 
@@ -142,6 +144,23 @@ def cleanup_profile_locks(profile_path: str) -> None:
                 file_path.unlink()
         except Exception:
             pass
+
+
+def prune_old_temp_profiles(base_path: pathlib.Path, keep_latest: int = 5) -> None:
+    '''
+    Keep only latest temp profile directories to avoid silent disk exhaustion.
+    '''
+    try:
+        base_path.mkdir(parents=True, exist_ok=True)
+        dirs = [p for p in base_path.iterdir() if p.is_dir() and p.name.startswith("run-")]
+        dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale_dir in dirs[keep_latest:]:
+            try:
+                shutil.rmtree(stale_dir, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def build_options(use_uc: bool, profile_path: str, profile_label: str) -> Options:

@@ -85,6 +85,7 @@ external_jobs_count = 0
 failed_count = 0
 skip_count = 0
 dailyEasyApplyLimitReached = False
+hr_connect_attempt_count = 0
 
 re_experience = re.compile(r'[(]?\s*(\d+)\s*[)]?\s*[-to]*\s*\d*[+]*\s*year[s]?', re.IGNORECASE)
 
@@ -187,6 +188,183 @@ def get_applied_job_ids() -> set[str]:
 
 
 
+def get_applied_csv_fieldnames() -> list[str]:
+    '''
+    Canonical schema for applied jobs history CSV.
+    '''
+    return [
+        'Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'About Job',
+        'Experience required', 'Skills required', 'HR Name', 'HR Link',
+        'HR Profile Opened', 'HR Connect', 'HR Follow', 'HR Add',
+        'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link',
+        'Questions Found',
+        'Apply Type', 'External Portal',
+        'External Apply Status', 'External Notes'
+    ]
+
+
+def _is_truthy_csv_value(value: object) -> bool:
+    '''
+    Normalize CSV bool-like strings into a boolean.
+    '''
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _to_csv_bool(value: object) -> str:
+    '''
+    Normalize booleans to lowercase string for consistent CSV values.
+    '''
+    return "true" if bool(value) else "false"
+
+
+def ensure_applied_csv_schema() -> None:
+    '''
+    Ensure applied CSV uses canonical schema.
+    Handles old `HR Link Collected` migration.
+    '''
+    if not os.path.exists(file_name) or os.path.getsize(file_name) == 0:
+        return
+
+    try:
+        with open(file_name, mode='r', newline='', encoding='utf-8') as existing_csv:
+            reader = csv.DictReader(existing_csv)
+            existing_header = reader.fieldnames or []
+            rows = list(reader)
+    except Exception as e:
+        print_lg("Could not inspect applied CSV schema for migration.", e)
+        return
+
+    target_header = get_applied_csv_fieldnames()
+    if existing_header == target_header:
+        return
+
+    migrated_rows: list[dict[str, object]] = []
+    for row in rows:
+        migrated_row: dict[str, object] = {}
+        for field in target_header:
+            if field == "HR Add":
+                source = row.get("HR Add", row.get("HR Link Collected", False))
+                migrated_row["HR Add"] = _to_csv_bool(_is_truthy_csv_value(source))
+            elif field in {"HR Profile Opened", "HR Connect", "HR Follow"}:
+                migrated_row[field] = _to_csv_bool(_is_truthy_csv_value(row.get(field, False)))
+            else:
+                migrated_row[field] = row.get(field, "")
+        migrated_rows.append(migrated_row)
+
+    with open(file_name, mode='w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=target_header)
+        writer.writeheader()
+        writer.writerows(migrated_rows)
+
+    print_lg("Applied CSV schema normalized and migrated to latest HR columns.")
+
+
+def _is_connect_success(connect_status: str) -> bool:
+    return str(connect_status).strip().lower() in {"sent", "sent_inferred", "already_connected", "pending_existing"}
+
+
+def _is_follow_success(follow_status: str) -> bool:
+    return str(follow_status).strip().lower() in {"followed", "already_following"}
+
+
+def run_hr_action_backfill(processed_job_ids: set[str] | None = None) -> None:
+    '''
+    Backfill recruiter connect/follow actions for older applied jobs in capped batches.
+    '''
+    processed_ids = processed_job_ids or set()
+    if not connect_hr:
+        print_lg("HR backfill skipped: connect_hr is disabled.")
+        return
+    ensure_applied_csv_schema()
+    if not os.path.exists(file_name) or os.path.getsize(file_name) == 0:
+        return
+
+    try:
+        with open(file_name, mode='r', newline='', encoding='utf-8') as csv_file:
+            reader = csv.DictReader(csv_file)
+            rows = list(reader)
+            fieldnames = reader.fieldnames or get_applied_csv_fieldnames()
+    except Exception as e:
+        print_lg("Backfill read failed for applied CSV.", e)
+        return
+
+    attempted = 0
+    succeeded = 0
+    failed = 0
+    pending_remaining = 0
+    changed = False
+
+    for idx, row in enumerate(rows):
+        row_id = str(row.get("Job ID", "")).strip() or f"row_{idx+2}"
+        if row_id in processed_ids:
+            continue
+
+        link = normalize_linkedin_person_url(row.get("HR Link", "Unknown"))
+        hr_add_existing = _is_truthy_csv_value(row.get("HR Add", False))
+        hr_connect_existing = _is_truthy_csv_value(row.get("HR Connect", False))
+        hr_follow_existing = _is_truthy_csv_value(row.get("HR Follow", False))
+        hr_profile_opened_existing = _is_truthy_csv_value(row.get("HR Profile Opened", False))
+
+        if link == "Unknown":
+            row["HR Profile Opened"] = _to_csv_bool(False)
+            row["HR Connect"] = _to_csv_bool(False)
+            row["HR Follow"] = _to_csv_bool(False)
+            row["HR Add"] = _to_csv_bool(False)
+            continue
+
+        row["HR Profile Opened"] = _to_csv_bool(hr_profile_opened_existing)
+        row["HR Connect"] = _to_csv_bool(hr_connect_existing)
+        row["HR Follow"] = _to_csv_bool(hr_follow_existing)
+        row["HR Add"] = _to_csv_bool(hr_add_existing)
+        if bool(hr_add_existing):
+            continue
+
+        if hr_connect_attempt_count >= max_hr_connect_attempts_per_run:
+            pending_remaining += 1
+            continue
+
+        action_result = process_hr_profile_actions(link)
+        connect_status = str(action_result.get("connect_status", "connect_failed"))
+        follow_status = str(action_result.get("follow_status", "follow_failed"))
+        hr_connect = bool(action_result.get("hr_connect", False) or _is_connect_success(connect_status))
+        hr_follow = bool(action_result.get("hr_follow", False) or _is_follow_success(follow_status))
+        hr_profile_opened = bool(action_result.get("profile_opened", False))
+        hr_add = bool(hr_connect or hr_follow)
+
+        row["HR Profile Opened"] = _to_csv_bool(hr_profile_opened)
+        row["HR Connect"] = _to_csv_bool(hr_connect)
+        row["HR Follow"] = _to_csv_bool(hr_follow)
+        row["HR Add"] = _to_csv_bool(hr_add)
+        changed = True
+
+        attempted += 1
+        if hr_add:
+            succeeded += 1
+        else:
+            failed += 1
+            pending_remaining += 1
+
+        print_lg(
+            f'HR action -> opened={hr_profile_opened}, connect={hr_connect}({connect_status}), '
+            f'follow={hr_follow}({follow_status}), add={hr_add}, link={link}, source=backfill, row_id={row_id}'
+        )
+
+    if changed:
+        try:
+            with open(file_name, mode='w', newline='', encoding='utf-8') as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            print_lg("Backfill write failed for applied CSV.", e)
+            return
+
+    print_lg(
+        f"HR backfill summary -> attempted={attempted}, succeeded={succeeded}, "
+        f"failed={failed}, pending_remaining={pending_remaining}"
+    )
+
+
 def find_first_by_xpaths(xpaths: list[str], timeout: float = 3.0) -> WebElement | None:
     '''
     Return the first element found from given XPaths, else `None`.
@@ -217,18 +395,30 @@ def click_first_by_xpaths(xpaths: list[str], reason: str, timeout: float = 3.0, 
                 element = None
                 while time.time() < end_time:
                     try:
-                        candidate = search_root.find_element(By.XPATH, xpath)
-                        if candidate.is_displayed() and candidate.is_enabled():
-                            element = candidate
+                        for candidate in search_root.find_elements(By.XPATH, xpath):
+                            if candidate.is_displayed() and candidate.is_enabled():
+                                element = candidate
+                                break
+                        if element is not None:
                             break
                     except Exception:
                         pass
                     sleep(0.2)
                 if element is None:
                     raise Exception(f"Not clickable in root for xpath: {xpath}")
+            try:
+                driver.execute_script('arguments[0].scrollIntoView({block: "center", behavior: "instant"});', element)
+            except Exception:
+                pass
             safe_click(element, reason=reason)
             return True
         except Exception:
+            try:
+                if 'element' in locals() and element is not None:
+                    driver.execute_script("arguments[0].click();", element)
+                    return True
+            except Exception:
+                pass
             continue
     return False
 
@@ -440,6 +630,10 @@ def extract_hr_info() -> tuple[str, str]:
     fallback_link_xpaths = [
         '//div[contains(@class,"jobs-unified-top-card")]//a[contains(@href,"/in/")]',
         '//section[contains(@class,"jobs-poster")]//a[contains(@href,"/in/")]',
+        '//div[contains(@class,"jobs-unified-top-card__content")]//a[contains(@href,"/in/")]',
+        '//div[contains(@class,"jobs-unified-top-card")]//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "job poster")]/ancestor::*[self::section or self::div][1]//a[contains(@href,"/in/")]',
+        '//div[contains(@class,"jobs-unified-top-card")]//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "promoted by hirer")]/ancestor::*[self::section or self::div][1]//a[contains(@href,"/in/")]',
+        '//div[contains(@class,"jobs-company")]//a[contains(@href,"/in/")]',
         '//main//a[contains(@href,"/in/")]',
         '//a[contains(@href,"linkedin.com/in/")]',
     ]
@@ -465,14 +659,448 @@ def extract_hr_info() -> tuple[str, str]:
                     if is_probable_person_name(candidate_name):
                         hr_name = candidate_name
                         break
-                if hr_name != "Unknown":
-                    return hr_name, normalized_link
+                # Keep link even when name is unavailable; connect/follow only needs profile URL.
+                if hr_name == "Unknown":
+                    hr_name = infer_name_from_linkedin_url(normalized_link)
+                return hr_name, normalized_link
             except Exception:
                 continue
+
+    modal_hr_name, modal_hr_link = extract_hr_info_from_hiring_team_modal(second_pass=False)
+    if modal_hr_link != "Unknown":
+        return modal_hr_name, modal_hr_link
+
+    # Retry modal extraction once after a small scroll because cards load lazily.
+    try:
+        driver.execute_script("window.scrollBy(0, 300);")
+        sleep(0.5)
+    except Exception:
+        pass
+    modal_hr_name, modal_hr_link = extract_hr_info_from_hiring_team_modal(second_pass=True)
+    if modal_hr_link != "Unknown":
+        return modal_hr_name, modal_hr_link
 
     print_lg("HR extraction fallback did not find any usable LinkedIn person profile link.")
 
     return "Unknown", "Unknown"
+
+
+def extract_hr_info_from_hiring_team_modal(second_pass: bool = False) -> tuple[str, str]:
+    '''
+    Best-effort extraction from "Meet the hiring team" modal/cards used on some job pages.
+    '''
+    trigger_xpaths = [
+        '//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "meet the hiring team")]',
+        '//a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "meet the hiring team")]',
+        '//button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "hiring team")]',
+        '//a[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "hiring team")]',
+    ]
+    modal_xpaths = [
+        '//div[@role="dialog" and .//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "hiring team")]]',
+        '//div[@role="dialog"]',
+    ]
+    close_xpaths = [
+        './/button[contains(@aria-label, "Dismiss")]',
+        './/button[contains(@aria-label, "Close")]',
+        './/button[@data-control-name="modal_dismiss"]',
+    ]
+
+    opened = click_first_by_xpaths(trigger_xpaths, reason="open_hiring_team_modal", timeout=2.5)
+    if not opened:
+        return "Unknown", "Unknown"
+
+    modal = find_first_by_xpaths(modal_xpaths, timeout=2.5)
+    if not modal:
+        actions.send_keys(Keys.ESCAPE).perform()
+        return "Unknown", "Unknown"
+
+    hr_name = "Unknown"
+    hr_link = "Unknown"
+    try:
+        if second_pass:
+            try:
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", modal)
+                sleep(0.5)
+            except Exception:
+                pass
+        anchors = modal.find_elements(By.XPATH, './/a[contains(@href, "/in/") or contains(@href, "linkedin.com/in/")]')
+        for anchor in anchors:
+            normalized_link = normalize_linkedin_person_url(anchor.get_attribute("href"))
+            if normalized_link == "Unknown":
+                continue
+            name_candidates = [
+                normalize_hr_value(anchor.text),
+                normalize_hr_value(anchor.get_attribute("aria-label")),
+                infer_name_from_linkedin_url(normalized_link),
+            ]
+            selected_name = "Unknown"
+            for candidate in name_candidates:
+                if is_probable_person_name(candidate):
+                    selected_name = candidate
+                    break
+            hr_name = selected_name
+            hr_link = normalized_link
+            break
+    except Exception:
+        pass
+    finally:
+        click_first_by_xpaths(close_xpaths, reason="close_hiring_team_modal", timeout=1.5, root=modal)
+        actions.send_keys(Keys.ESCAPE).perform()
+
+    return hr_name, hr_link
+
+
+def _get_profile_action_root(timeout: float = 3.5) -> WebElement | None:
+    '''
+    Returns profile top-card/action container, else None.
+    Never falls back to full-page driver to avoid accidental clicks in feed/sidebar.
+    '''
+    root_xpaths = [
+        '//main//section[contains(@class,"pv-top-card")]',
+        '//main//div[contains(@class,"pv-top-card")]',
+        '//main//section[contains(@class,"top-card")]',
+        '//main//div[contains(@class,"top-card")]',
+        '//main//*[contains(@class,"profile-topcard")]',
+        '//main//*[contains(@class,"pv-top-card-v2-ctas")]',
+        '//main//*[contains(@class,"pvs-profile-actions")]',
+        '//main//*[contains(@class,"top-card-layout")]',
+        '//section[contains(@class,"pv-top-card")]',
+        '//div[contains(@class,"pv-top-card")]',
+    ]
+    for xp in root_xpaths:
+        try:
+            root = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.XPATH, xp))
+            )
+            if root and root.is_displayed():
+                return root
+        except Exception:
+            continue
+    try:
+        current_url = str(driver.current_url).lower()
+        if "linkedin.com/in/" in current_url:
+            main_root = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.XPATH, '//main'))
+            )
+            if main_root and main_root.is_displayed():
+                return main_root
+    except Exception:
+        pass
+    return None
+
+
+def _find_first_in_root(root: WebElement | None, xpaths: list[str], timeout: float = 2.0) -> WebElement | None:
+    '''
+    Finds first displayed element by trying provided relative xpaths within a root.
+    '''
+    if root is None:
+        return None
+
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        for xp in xpaths:
+            try:
+                for candidate in root.find_elements(By.XPATH, xp):
+                    if candidate and candidate.is_displayed():
+                        return candidate
+            except Exception:
+                continue
+        sleep(0.2)
+    return None
+
+
+def _dismiss_obstructive_dialogs() -> None:
+    '''
+    Best-effort close for share/send dialogs that can intercept profile actions.
+    '''
+    dialog_close_xpaths = [
+        '//div[@role="dialog"]//button[contains(@aria-label, "Dismiss")]',
+        '//div[@role="dialog"]//button[contains(@aria-label, "Close")]',
+        '//div[@role="dialog"]//button[contains(@data-control-name, "modal_dismiss")]',
+    ]
+    click_first_by_xpaths(dialog_close_xpaths, reason="dismiss_dialog", timeout=1.0)
+    try:
+        actions.send_keys(Keys.ESCAPE).perform()
+    except Exception:
+        pass
+
+
+def _get_retry_passes() -> int:
+    try:
+        return max(1, min(3, int(retry_hr_connect_passes)))
+    except Exception:
+        return 2
+
+
+def _attempt_connect_once() -> tuple[str, bool]:
+    '''
+    One pass connect attempt on currently opened recruiter profile tab.
+    Returns: (status, saw_connect_ui)
+    '''
+    action_root = _get_profile_action_root(timeout=2.8)
+    _dismiss_obstructive_dialogs()
+
+    if action_root is None:
+        return "connect_not_available", False
+
+    pending_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "pending")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "pending")]',
+    ]
+    invite_limit_xpaths = [
+        '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "invitation limit")]',
+        '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "weekly invitation")]',
+        '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "cannot connect right now")]',
+    ]
+    connect_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "invite")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "invite")]',
+        './/div[@role="button"][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+    ]
+    more_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "more actions")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "more")]',
+    ]
+    dropdown_connect_xpaths = [
+        '//div[@role="menu"]//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        '//div[@role="menu"]//*[self::div or self::li][@role="menuitem" and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        '//div[@role="menu"]//*[contains(@class, "artdeco-dropdown__item") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        '//div[@role="menu"]//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        '//div[@role="menu"]//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "invite")]',
+    ]
+    menu_container_xpaths = [
+        '//div[@role="menu"]',
+        '//div[contains(@class, "artdeco-dropdown__content")]',
+        '//div[contains(@class, "artdeco-dropdown__content-inner")]',
+    ]
+    menu_connect_xpaths = [
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/*[self::div or self::li][@role="menuitem" and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/*[contains(@class, "artdeco-dropdown__item") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "connect")]',
+        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "invite")]',
+    ]
+    invite_dialog_xpaths = [
+        '//div[@role="dialog" and .//button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send")]]',
+        '//div[@role="dialog" and .//button[.//span[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send")]]]',
+        '//div[@role="dialog"]',
+        '//div[contains(@class, "artdeco-modal")]',
+        '//section[contains(@class, "artdeco-modal")]',
+    ]
+    send_without_note_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send without a note")]',
+        './/button[.//span[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send without a note")]]',
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send now")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send")]',
+        './/button[contains(@class, "artdeco-button--primary") and .//span[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "send")]]',
+    ]
+
+    if find_first_by_xpaths(invite_limit_xpaths, timeout=1.2):
+        return "invite_limit", False
+    if _find_first_in_root(action_root, pending_xpaths, timeout=1.2):
+        return "pending_existing", False
+
+    saw_connect_ui = _find_first_in_root(action_root, connect_xpaths, timeout=1.0) is not None
+    connect_clicked = click_first_by_xpaths(connect_xpaths, reason="hr_connect_button", timeout=2.2, root=action_root)
+    if not connect_clicked and click_first_by_xpaths(more_xpaths, reason="hr_more_actions", timeout=1.8, root=action_root):
+        menu_root = find_first_by_xpaths(menu_container_xpaths, timeout=2.0)
+        if menu_root is not None:
+            connect_clicked = click_first_by_xpaths(menu_connect_xpaths, reason="hr_connect_menu_root", timeout=2.5, root=menu_root)
+        if not connect_clicked:
+            connect_clicked = click_first_by_xpaths(dropdown_connect_xpaths, reason="hr_connect_menu", timeout=2.5)
+        saw_connect_ui = saw_connect_ui or connect_clicked
+
+    if not connect_clicked:
+        return "connect_not_available", saw_connect_ui
+
+    if find_first_by_xpaths(invite_limit_xpaths, timeout=1.2):
+        return "invite_limit", True
+
+    if _find_first_in_root(action_root, pending_xpaths, timeout=1.5):
+        return "pending_existing", True
+
+    invite_dialog = find_first_by_xpaths(invite_dialog_xpaths, timeout=2.2)
+    if invite_dialog is None:
+        if find_first_by_xpaths(pending_xpaths, timeout=1.2):
+            return "pending_existing", True
+        if _find_first_in_root(action_root, connect_xpaths, timeout=1.2) is None:
+            return "sent_inferred", True
+        return "connect_failed", True
+
+    sent_clicked = click_first_by_xpaths(send_without_note_xpaths, reason="hr_send_invite", timeout=3.2, root=invite_dialog)
+    if sent_clicked:
+        if find_first_by_xpaths(pending_xpaths, timeout=1.2):
+            return "pending_existing", True
+        return "sent", True
+
+    if find_first_by_xpaths(pending_xpaths, timeout=1.2):
+        return "pending_existing", True
+
+    if _find_first_in_root(action_root, connect_xpaths, timeout=1.0) is None:
+        return "sent_inferred", True
+
+    return "connect_failed", True
+
+
+def _attempt_follow_recruiter() -> tuple[bool, str]:
+    '''
+    Follow recruiter profile on the current page.
+    '''
+    action_root = _get_profile_action_root(timeout=2.8)
+    _dismiss_obstructive_dialogs()
+
+    if action_root is None:
+        return False, "follow_not_available"
+
+    following_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "following")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "following")]',
+        './/button[@aria-pressed="true" and contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+    ]
+    follow_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+    ]
+    more_xpaths = [
+        './/button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "more actions")]',
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "more")]',
+    ]
+    dropdown_follow_xpaths = [
+        '//div[@role="menu"]//button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        '//div[@role="menu"]//*[self::div or self::li][@role="menuitem" and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        '//div[@role="menu"]//*[contains(@class, "artdeco-dropdown__item") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        '//div[@role="menu"]//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+    ]
+    menu_container_xpaths = [
+        '//div[@role="menu"]',
+        '//div[contains(@class, "artdeco-dropdown__content")]',
+        '//div[contains(@class, "artdeco-dropdown__content-inner")]',
+    ]
+    menu_follow_xpaths = [
+        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        './/*[self::div or self::li][@role="menuitem" and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        './/*[contains(@class, "artdeco-dropdown__item") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "follow")]',
+    ]
+
+    if _find_first_in_root(action_root, following_xpaths, timeout=1.2):
+        return True, "already_following"
+
+    follow_clicked = click_first_by_xpaths(follow_xpaths, reason="hr_follow_button", timeout=2.2, root=action_root)
+    if (not follow_clicked) and click_first_by_xpaths(more_xpaths, reason="hr_more_actions_follow", timeout=1.8, root=action_root):
+        menu_root = find_first_by_xpaths(menu_container_xpaths, timeout=2.0)
+        if menu_root is not None:
+            follow_clicked = click_first_by_xpaths(menu_follow_xpaths, reason="hr_follow_menu_root", timeout=2.5, root=menu_root)
+        if not follow_clicked:
+            follow_clicked = click_first_by_xpaths(dropdown_follow_xpaths, reason="hr_follow_menu", timeout=2.5)
+
+    if not follow_clicked:
+        return False, "follow_not_available"
+
+    if _find_first_in_root(action_root, following_xpaths, timeout=1.5):
+        return True, "followed"
+    return False, "follow_failed"
+
+
+def process_hr_profile_actions(hr_link: str) -> dict[str, str | bool]:
+    '''
+    Opens recruiter profile in a new tab and attempts connect + follow.
+    '''
+    global hr_connect_attempt_count
+
+    result: dict[str, str | bool] = {
+        "profile_opened": False,
+        "hr_add": False,
+        "hr_connect": False,
+        "connect_status": "no_hr_link",
+        "hr_follow": False,
+        "follow_status": "skipped",
+        "hr_link": normalize_linkedin_person_url(hr_link),
+    }
+
+    normalized_link = result["hr_link"]
+    if normalized_link == "Unknown":
+        return result
+
+    if hr_connect_attempt_count >= max_hr_connect_attempts_per_run:
+        result["connect_status"] = "skipped_limit"
+        result["follow_status"] = "skipped_limit"
+        return result
+
+    hr_connect_attempt_count += 1
+    origin_tab = driver.current_window_handle
+    opened_temp_tab = False
+
+    try:
+        driver.switch_to.new_window('tab')
+        opened_temp_tab = True
+        driver.get(normalized_link)
+        try:
+            WebDriverWait(driver, 8).until(
+                lambda d: "linkedin.com/in/" in str(d.current_url).lower()
+            )
+            WebDriverWait(driver, 8).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
+        result["profile_opened"] = "linkedin.com/in/" in str(driver.current_url).lower()
+        sleep(2.5)
+        _dismiss_obstructive_dialogs()
+
+        connect_status = "connect_failed"
+        saw_connect_ui = False
+        passes = _get_retry_passes()
+        for attempt in range(passes):
+            if attempt > 0:
+                try:
+                    driver.execute_script("window.scrollTo(0, 0);")
+                    sleep(0.7)
+                except Exception:
+                    pass
+            attempt_status, saw_ui = _attempt_connect_once()
+            saw_connect_ui = saw_connect_ui or saw_ui
+            connect_status = attempt_status
+            if attempt_status in {"sent", "already_connected", "pending_existing", "invite_limit"}:
+                break
+
+        if connect_status == "connect_not_available" and saw_connect_ui:
+            connect_status = "connect_failed"
+
+        result["connect_status"] = connect_status
+        result["hr_connect"] = _is_connect_success(connect_status)
+        result["hr_add"] = bool(result["hr_connect"])
+
+        if follow_hr:
+            followed, follow_status = _attempt_follow_recruiter()
+            result["hr_follow"] = followed
+            result["follow_status"] = follow_status
+        else:
+            result["follow_status"] = "disabled"
+        result["hr_add"] = bool(result["hr_add"] or result["hr_follow"] or _is_follow_success(str(result["follow_status"])))
+    except Exception as e:
+        print_lg(f"HR action attempt failed for profile: {normalized_link}", e)
+        result["connect_status"] = "connect_failed"
+        result["hr_connect"] = False
+        result["hr_add"] = False
+        result["follow_status"] = "follow_failed" if follow_hr else "disabled"
+    finally:
+        try:
+            if opened_temp_tab and driver.current_window_handle != origin_tab:
+                driver.close()
+        except Exception:
+            pass
+        try:
+            if origin_tab in driver.window_handles:
+                driver.switch_to.window(origin_tab)
+            elif driver.window_handles:
+                driver.switch_to.window(driver.window_handles[0])
+        except Exception:
+            pass
+
+    return result
 
 
 def is_filter_selected(text: str) -> bool:
@@ -1519,38 +2147,22 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
                    reposted: bool, date_listed: datetime | Literal['Unknown'],
                    date_applied: datetime | Literal['Pending'],
                    job_link: str, application_link: str,
-                   questions_list: set | None, connect_request: Literal['In Development'],
+                   questions_list: set | None, connect_request: str, hr_add: bool,
+                   hr_connect: bool, hr_follow: bool, hr_profile_opened: bool, hr_follow_status: str,
+                   hr_action_last_tried: str, hr_action_attempts: int, hr_action_pending: bool,
                    external_outcome: ExternalApplyOutcome | None = None) -> None:
     '''
     Function to create or update the Applied jobs CSV file, once the application is submitted successfully.
     '''
     try:
-        fieldnames = [
-            'Job ID', 'Title', 'Company', 'Work Location', 'Work Style', 'About Job',
-            'Experience required', 'Skills required', 'HR Name', 'HR Link', 'HR Link Collected',
-            'Resume', 'Re-posted', 'Date Posted', 'Date Applied', 'Job Link', 'External Job link',
-            'Questions Found', 'Connect Request', 'Apply Type', 'External Portal',
-            'External Apply Status', 'External Notes'
-        ]
+        ensure_applied_csv_schema()
+        fieldnames = get_applied_csv_fieldnames()
         normalized_hr_name = normalize_hr_value(hr_name)
         normalized_hr_link = normalize_linkedin_person_url(hr_link)
-        hr_link_collected = is_valid_linkedin_person_url(normalized_hr_link)
-        if not hr_link_collected:
+        if not is_valid_linkedin_person_url(normalized_hr_link):
             normalized_hr_link = "Unknown"
         elif normalized_hr_name == "Unknown":
             normalized_hr_name = infer_name_from_linkedin_url(normalized_hr_link)
-
-        if os.path.exists(file_name) and os.path.getsize(file_name) > 0:
-            with open(file_name, mode='r', newline='', encoding='utf-8') as existing_csv:
-                existing_header = next(csv.reader(existing_csv), [])
-            if existing_header and existing_header != fieldnames:
-                error_msg = (
-                    f"Applied CSV header mismatch in '{file_name}'. "
-                    "Expected simplified HR columns near 'HR Link' (HR Link Collected only). "
-                    "Please migrate or rename the existing file before running."
-                )
-                print_lg(error_msg)
-                raise ValueError(error_msg)
 
         is_easy_applied = str(application_link).strip().lower() == "easy applied"
         is_external = bool(application_link and (not is_easy_applied) and ("linkedin.com" not in application_link.lower()))
@@ -1584,7 +2196,10 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
                 'Skills required': truncate_for_csv(skills),
                 'HR Name': truncate_for_csv(normalized_hr_name),
                 'HR Link': truncate_for_csv(normalized_hr_link),
-                'HR Link Collected': hr_link_collected,
+                'HR Profile Opened': _to_csv_bool(hr_profile_opened),
+                'HR Connect': _to_csv_bool(hr_connect),
+                'HR Follow': _to_csv_bool(hr_follow),
+                'HR Add': _to_csv_bool(hr_add),
                 'Resume': truncate_for_csv(resume),
                 'Re-posted': truncate_for_csv(reposted),
                 'Date Posted': truncate_for_csv(date_listed),
@@ -1592,7 +2207,6 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
                 'Job Link': truncate_for_csv(job_link),
                 'External Job link': truncate_for_csv(application_link),
                 'Questions Found': truncate_for_csv(questions_list),
-                'Connect Request': truncate_for_csv(connect_request),
                 'Apply Type': truncate_for_csv(apply_type),
                 'External Portal': truncate_for_csv(external_portal),
                 'External Apply Status': truncate_for_csv(external_status),
@@ -1655,8 +2269,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
     applied_jobs = get_applied_job_ids()
     rejected_jobs = set()
     blacklisted_companies = set()
-    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume
+    processed_job_ids_this_run: set[str] = set()
+    global current_city, failed_count, skip_count, easy_applied_count, external_jobs_count, tabs_count, pause_before_submit, pause_at_failed_question, useNewResume, hr_connect_attempt_count
     current_city = current_city.strip()
+    hr_connect_attempt_count = 0
+    stop_due_daily_limit = False
 
     if randomize_search_order:  shuffle(search_terms)
     for searchTerm in search_terms:
@@ -1779,7 +2396,15 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     date_applied = "Pending"
                     hr_link = "Unknown"
                     hr_name = "Unknown"
-                    connect_request = "In Development" # Still in development
+                    hr_add = False
+                    hr_connect = False
+                    connect_request = "not_attempted"
+                    hr_follow = False
+                    hr_profile_opened = False
+                    hr_follow_status = "not_attempted"
+                    hr_action_last_tried = ""
+                    hr_action_attempted = 0
+                    hr_action_pending = False
                     date_listed = "Unknown"
                     skills = "Needs an AI" # Still in development
                     resume = "Pending"
@@ -1992,9 +2617,48 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         )
                         if dailyEasyApplyLimitReached:
                             print_lg("\n###############  Daily application limit for Easy Apply is reached!  ###############\n")
-                            return
+                            stop_due_daily_limit = True
+                            break
                         if skip: continue
                         application_link = external_outcome.application_link if external_outcome else application_link
+
+                    if connect_hr:
+                        if normalize_linkedin_person_url(hr_link) == "Unknown":
+                            try:
+                                retry_hr_name, retry_hr_link = extract_hr_info()
+                                if normalize_linkedin_person_url(retry_hr_link) != "Unknown":
+                                    hr_name = retry_hr_name
+                                    hr_link = retry_hr_link
+                                    print_lg(
+                                        f'HR retry extraction success for Job ID {job_id}: '
+                                        f'name={hr_name}, link={hr_link}'
+                                    )
+                            except Exception as retry_error:
+                                print_lg(f'HR retry extraction failed for Job ID {job_id}.', retry_error)
+
+                        hr_action_result = process_hr_profile_actions(hr_link)
+                        connect_request = str(hr_action_result.get("connect_status", "connect_failed"))
+                        hr_follow_status = str(hr_action_result.get("follow_status", "follow_failed"))
+                        hr_profile_opened = bool(hr_action_result.get("profile_opened", False))
+                        hr_connect = bool(hr_action_result.get("hr_connect", False) or _is_connect_success(connect_request))
+                        hr_follow = bool(hr_action_result.get("hr_follow", False) or _is_follow_success(hr_follow_status))
+                        hr_add = bool(hr_connect or hr_follow)
+                    else:
+                        hr_add = False
+                        hr_connect = False
+                        connect_request = "disabled"
+                        hr_follow = False
+                        hr_profile_opened = False
+                        hr_follow_status = "disabled"
+
+                    hr_action_attempted = 1 if connect_request not in {"no_hr_link", "disabled", "skipped_limit", "not_attempted"} else 0
+                    hr_action_last_tried = str(datetime.now()) if hr_action_attempted else ""
+                    hr_action_pending = False
+
+                    print_lg(
+                        f'HR action -> opened={hr_profile_opened}, connect={hr_connect}({connect_request}), '
+                        f'follow={hr_follow}({hr_follow_status}), add={hr_add}, link={hr_link}, source=new, row_id={job_id}'
+                    )
 
                     submitted_jobs(
                         job_id,
@@ -2015,6 +2679,14 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         application_link,
                         questions_list,
                         connect_request,
+                        hr_add,
+                        hr_connect,
+                        hr_follow,
+                        hr_profile_opened,
+                        hr_follow_status,
+                        hr_action_last_tried,
+                        hr_action_attempted,
+                        hr_action_pending,
                         external_outcome=external_outcome,
                     )
                     if uploaded:   useNewResume = False
@@ -2024,6 +2696,10 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if application_link == "Easy Applied": easy_applied_count += 1
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
+                    processed_job_ids_this_run.add(job_id)
+
+                if stop_due_daily_limit:
+                    break
 
 
 
@@ -2042,6 +2718,8 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                 f'Completed search term "{searchTerm}" with location_guard_skips={location_skip_count_this_search} '
                 f'and filters_applied={filters_applied}.'
             )
+            if stop_due_daily_limit:
+                break
 
         except StaleElementReferenceException as e:
             print_lg("Stale element encountered while processing jobs. Refreshing list and continuing.", e)
@@ -2060,6 +2738,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
             except Exception as page_source_error:
                 print_lg(f"Failed to get page source, browser might have crashed. {page_source_error}")
             # print_lg(e)
+        if stop_due_daily_limit:
+            break
+
+    # Backfill recruiter actions for older applied rows in capped batches.
+    run_hr_action_backfill(processed_job_ids_this_run)
 
         
 def run(total_runs: int) -> int:
@@ -2104,7 +2787,12 @@ def main() -> None:
         global linkedIn_tab, tabs_count, useNewResume, aiClient, driver
         alert_title = "Error Occurred. Closing Browser!"
         validate_config()
-        print_lg("HR enrichment disabled: using LinkedIn HR extraction only (HR Name/HR Link).")
+        print_lg(
+            "HR automation config -> "
+            f"connect_hr={connect_hr}, follow_hr={follow_hr}, "
+            f"max_hr_connect_attempts_per_run={max_hr_connect_attempts_per_run}, "
+            f"retry_hr_connect_passes={retry_hr_connect_passes}"
+        )
         
         if not os.path.exists(default_resume_path):
             pyautogui.alert(text='Your default resume "{}" is missing! Please update it\'s folder path "default_resume_path" in config.py\n\nOR\n\nAdd a resume with exact name and path (check for spelling mistakes including cases).\n\n\nFor now the bot will continue using your previous upload from LinkedIn!'.format(default_resume_path), title="Missing Resume", button="OK")

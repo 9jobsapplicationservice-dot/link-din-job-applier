@@ -1,4 +1,4 @@
-'''
+﻿'''
 Author:     Sai Vignesh Golla
 LinkedIn:   https://www.linkedin.com/in/saivigneshgolla/
 
@@ -13,7 +13,7 @@ import sys
 import json
 import pathlib
 
-from time import sleep
+from time import sleep, time
 from random import randint, uniform
 from datetime import datetime, timedelta
 from pyautogui import alert
@@ -146,22 +146,41 @@ def get_log_path():
 
 
 __logs_file_path = get_log_path()
+__log_file_available = True
+__next_log_retry_at = 0.0
+__log_write_warned = False
 
 
 def print_lg(*msgs: str | dict, end: str = "\n", pretty: bool = False, flush: bool = False, from_critical: bool = False) -> None:
     '''
     Function to log and print. **Note that, `end` and `flush` parameters are ignored if `pretty = True`**
     '''
+    global __log_file_available, __next_log_retry_at, __log_write_warned
     try:
         for message in msgs:
             pprint(message) if pretty else print(message, end=end, flush=flush)
-            with open(__logs_file_path, 'a+', encoding="utf-8") as file:
-                file.write(str(message) + end)
+            now = time()
+            should_try_file_write = __log_file_available or now >= __next_log_retry_at
+            if not should_try_file_write:
+                continue
+            try:
+                with open(__logs_file_path, 'a+', encoding="utf-8") as file:
+                    file.write(str(message) + end)
+                __log_file_available = True
+                __log_write_warned = False
+            except Exception:
+                __log_file_available = False
+                __next_log_retry_at = now + 10
+                if not __log_write_warned:
+                    print(
+                        f"[WARN] Could not write to log file at '{__logs_file_path}'. "
+                        "Continuing without file logging; will retry automatically."
+                    )
+                    __log_write_warned = True
     except Exception as e:
-        trail = f'Skipped saving this message: "{message}" to log.txt!' if from_critical else "We'll try one more time to log..."
-        alert(f"log.txt in {logs_folder_path} is open or is occupied by another program! Please close it! {trail}", "Failed Logging")
+        print(f"[WARN] print_lg fallback triggered: {e}")
         if not from_critical:
-            critical_error_log("Log.txt is open or is occupied by another program!", e)
+            critical_error_log("print_lg failed unexpectedly", e)
 
 
 def critical_error_log(possible_reason: str, stack_trace: Exception) -> None:

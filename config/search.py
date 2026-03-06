@@ -19,15 +19,29 @@ version:    26.01.20.5.08
 # These Sentences are Searched in LinkedIn
 # Enter your search terms inside '[ ]' with quotes ' "searching title" ' for each search followed by comma ', ' Eg: ["Software Engineer", "Software Developer", "Selenium Developer"]
 search_terms = [
-    "Construction Site Supervisor",
-    "Site Supervisor",
-    "Assistant Site Supervisor",
-    "Junior Site Supervisor",
-    "Site Coordinator",
-    "Project Coordinator Construction",
-    "Site Manager",
-    "Junior Site Manager"
-   
+    "Business Analyst",
+    "Data Entry Assistant",
+    "Data Entry Coordinator",       
+    "Data Entry Technician",
+    "Data Entry Analyst",
+    "Data Entry Administrator",
+    "Data Entry Associate",
+    "Data Entry Support",
+    "Data Entry Worker",
+    "Data Entry Representative",
+    "Data Entry Operator",
+    "Data Entry Specialist",
+    "Data Entry Clerk",
+    "Data Entry Assistant",
+    "Data Entry Coordinator",
+    "Data Entry Technician",  
+    "Data Entry Analyst",
+    "Data Entry Administrator",
+    "Data Entry Associate",
+    "Data Entry Support",
+    "Data Entry Worker",
+    "Data Entry Representative",
+ 
 ]
 
 # Search location, this will be filled in "City, state, or zip code" search box. If left empty as "", tool will not fill it.
